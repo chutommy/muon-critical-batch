@@ -1,0 +1,6 @@
+.venv/
+__pycache__/
+data/fineweb10B/
+configs/sweep/
+analysis/tables/
+.DS_Store
