@@ -1,0 +1,664 @@
+"""
+train_gpt_simple.py
+
+Fork of `records/track_3_optimization/train_gpt_simple.py` from modded-nanogpt.
+    repo:   https://github.com/KellerJordan/modded-nanogpt
+    commit: 73ba75775fb134157cc7a8d61f3b0d1b524b74e6
+"""
+
+import argparse
+import json
+import os
+import sys
+with open(sys.argv[0]) as f:
+    code = f.read() # read the code of this file ASAP, for logging
+import uuid
+import time
+from pathlib import Path
+
+import torch
+from torch import Tensor, nn
+from torch.optim import AdamW
+import torch.nn.functional as F
+import torch.distributed as dist
+
+
+########################################
+#              Dataloader              #
+########################################
+
+def _load_data_shard(file: Path):
+    header = torch.from_file(str(file), False, 256, dtype=torch.int32) # header is 256 int32
+    assert header[0] == 20240520, "magic number mismatch in the data .bin file"
+    assert header[1] == 1, "unsupported version"
+    num_tokens = int(header[2]) # number of tokens (claimed)
+    with file.open("rb", buffering=0) as f:
+        tokens = torch.empty(num_tokens, dtype=torch.uint16, pin_memory=True)
+        f.seek(256 * 4)
+        nbytes = f.readinto(tokens.numpy()) # avoid bytes->array copy
+        assert nbytes == 2 * num_tokens, "number of tokens read does not match header"
+    return tokens
+
+def distributed_data_generator(filename_pattern: str, batch_size: int, seq_len=1024):
+    files = sorted(Path.cwd().glob(filename_pattern))
+    assert batch_size % dist.get_world_size() == 0
+    local_batch_size = batch_size // dist.get_world_size()
+    file_iter = iter(files)
+    tokens, pos = _load_data_shard(next(file_iter)), 0
+    while True:
+        if pos + batch_size + 1 >= len(tokens):
+            tokens, pos = _load_data_shard(next(file_iter)), 0
+        buf = tokens[pos + dist.get_rank() * local_batch_size:][:local_batch_size + 1]
+        inputs = buf[:-1].to(device="cuda", dtype=torch.int32, non_blocking=True)
+        targets = buf[1:].to(device="cuda", dtype=torch.int64, non_blocking=True)
+        pos += batch_size
+        yield inputs.view(-1, seq_len), targets.view(-1, seq_len)
+
+
+########################################
+#             Architecture             #
+########################################
+
+class RMSNorm(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.gains = nn.Parameter(torch.ones(dim))
+
+    def forward(self, x):
+        return F.rms_norm(x, (x.size(-1),), weight=self.gains.type_as(x))
+
+class Linear(nn.Linear):
+    def __init__(self, in_features, out_features):
+        super().__init__(in_features, out_features, bias=True)
+
+    def forward(self, x):
+        return F.linear(x, self.weight.type_as(x), self.bias.type_as(x))
+
+class Rotary(nn.Module):
+    def __init__(self, dim: int):
+        super().__init__()
+        # half-truncate RoPE (w/ base freq tuning)
+        angular_freq = (1 / 1024) ** torch.linspace(0, 1, steps=dim//4, dtype=torch.float32)
+        self.register_buffer("angular_freq", torch.cat([angular_freq, angular_freq.new_zeros(dim//4)]))
+
+    def forward(self, x_BTHD: Tensor):
+        pos = torch.arange(x_BTHD.size(1), dtype=torch.float32, device=x_BTHD.device)
+        theta = torch.outer(pos, self.angular_freq)[None, :, None, :]
+        cos, sin = theta.cos(), theta.sin()
+        x1, x2 = x_BTHD.to(dtype=torch.float32).chunk(2, dim=-1)
+        y1 = x1 * cos + x2 * sin
+        y2 = x1 * (-sin) + x2 * cos
+        return torch.cat((y1, y2), 3).type_as(x_BTHD)
+
+class CausalSelfAttention(nn.Module):
+    def __init__(self, dim: int, head_dim=128):
+        super().__init__()
+        self.num_heads = dim // head_dim
+        self.head_dim = head_dim
+        hdim = self.num_heads * self.head_dim
+        self.q = Linear(dim, hdim)
+        self.k = Linear(dim, hdim)
+        self.v = Linear(dim, hdim)
+        self.proj = Linear(hdim, dim)
+        self.rotary = Rotary(head_dim)
+
+    def forward(self, x: Tensor):
+        B, T = x.size(0), x.size(1)
+        q = self.q(x).view(B, T, self.num_heads, self.head_dim)
+        k = self.k(x).view(B, T, self.num_heads, self.head_dim)
+        v = self.v(x).view(B, T, self.num_heads, self.head_dim)
+        q, k = F.rms_norm(q, (q.size(-1),)), F.rms_norm(k, (k.size(-1),))
+        q, k = self.rotary(q), self.rotary(k)
+        y = F.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2),
+                                           v.transpose(1, 2), scale=0.12, is_causal=True).transpose(1, 2)
+        y = y.contiguous().view(B, T, self.num_heads * self.head_dim)
+        y = self.proj(y)
+        return y
+
+class MLP(nn.Module):
+    def __init__(self, dim: int):
+        super().__init__()
+        hdim = 4 * dim
+        self.fc = Linear(dim, hdim)
+        self.proj = Linear(hdim, dim)
+
+    def forward(self, x: Tensor):
+        x = self.fc(x)
+        x = x.relu().square()
+        x = self.proj(x)
+        return x
+
+class Block(nn.Module):
+    def __init__(self, dim: int):
+        super().__init__()
+        self.attn = CausalSelfAttention(dim)
+        self.mlp = MLP(dim)
+        self.norm1 = RMSNorm(dim)
+        self.norm2 = RMSNorm(dim)
+
+    def forward(self, x: Tensor):
+        x = x + self.attn(self.norm1(x))
+        x = x + self.mlp(self.norm2(x))
+        return x
+
+class GPT(nn.Module):
+    def __init__(self, vocab_size: int, num_layers: int, model_dim: int):
+        super().__init__()
+        self.embed = nn.Embedding(vocab_size, model_dim).bfloat16()
+        self.blocks = nn.ModuleList([Block(model_dim) for _ in range(num_layers)])
+        self.proj = Linear(model_dim, vocab_size)
+        self.norm1 = RMSNorm(model_dim)
+        self.norm2 = RMSNorm(model_dim)
+
+    def forward(self, inputs: Tensor, targets: Tensor):
+        x = self.norm1(self.embed(inputs))
+        for block in self.blocks:
+            x = block(x)
+        logits = self.proj(self.norm2(x)).float()
+        logits = 15 * logits * (logits.square() + 15**2).rsqrt()
+        return F.cross_entropy(logits.view(targets.numel(), -1), targets.view(-1), reduction="sum")
+
+
+########################################
+#              Optimizer               #
+########################################
+
+def zeropower_via_newtonschulz5(G: Tensor) -> Tensor:
+    assert G.ndim >= 2
+    X = G.bfloat16()
+    if G.size(-2) > G.size(-1):
+        X = X.mT
+
+    # Ensure spectral norm is at most 1
+    X = X / (X.norm(dim=(-2, -1), keepdim=True) + 1e-7)
+    # Perform the NS iterations, not optimizing for wallclock speed
+    a, b, c = 2, -1.5, 0.5
+    for _ in range(12):
+        A = X @ X.mT
+        B = b * A + c * A @ A
+        X = a * X + B @ X
+
+    if G.size(-2) > G.size(-1):
+        X = X.mT
+    return X
+
+@torch.compile
+def muon_update(grad, momentum, mu=0.95, nesterov=True):
+    momentum.lerp_(grad, 1 - mu)
+    update = grad.lerp_(momentum, mu) if nesterov else momentum
+    update = zeropower_via_newtonschulz5(update)
+    update *= max(1, grad.size(-2) / grad.size(-1))**0.5
+    return update
+
+class Muon(torch.optim.Optimizer):
+    def __init__(self, params, lr=0.02, weight_decay=0, mu=0.95):
+        assert isinstance(params, list) and len(params) >= 1 and isinstance(params[0], torch.nn.Parameter)
+        params = sorted(params, key=lambda x: x.size(), reverse=True)
+        defaults = dict(lr=lr, weight_decay=weight_decay, mu=mu)
+        super().__init__(params, defaults)
+
+    @torch.no_grad()
+    def step(self):
+        world_size = dist.get_world_size()
+        rank = dist.get_rank()
+        for group in self.param_groups:
+            params = group["params"]
+            params_pad = params + [torch.empty_like(params[-1])] * (world_size - len(params) % world_size)
+            for base_i in range(0, len(params), world_size):
+                if base_i + rank < len(params):
+                    p = params[base_i + rank]
+                    state = self.state[p]
+                    if len(state) == 0:
+                        state["momentum"] = torch.zeros_like(p)
+                    update = muon_update(p.grad, state["momentum"], mu=group["mu"])
+                    p.mul_(1 - group["lr"] * group["weight_decay"])
+                    p.add_(update, alpha=-group["lr"])
+                dist.all_gather(params_pad[base_i:base_i + world_size], params_pad[base_i + rank])
+
+
+def measure_noise_scale(model, params, loader, b_small_seqs, mbs, seq_len):
+    """McCandlish (2018) two-independent-batch gradient noise scale.
+
+    For two disjoint micro-batches of b_small_seqs sequences (split across ranks),
+    compute the mean per-sequence gradient G1, G2 on `params`. Then
+      tr(Sigma)        ~= (b_small_seqs / 2) * |G1 - G2|^2
+      |G_true|^2       ~= G1 . G2
+      B_noise_examples  = tr(Sigma) / |G_true|^2
+      B_noise_tokens    = B_noise_examples * seq_len
+
+    Caller's grads are zeroed before return. Loader is a separate generator
+    (different shards from training) yielding (b_small_seqs / world_size)
+    sequences per call.
+    """
+    grads = []
+    for _ in range(2):
+        for p in params:
+            p.grad = None
+        inputs, targets = next(loader)
+        assert len(inputs) % mbs == 0
+        for i in range(0, len(inputs), mbs):
+            model(inputs[i:i+mbs], targets[i:i+mbs]).backward()
+        for p in params:
+            dist.all_reduce(p.grad, op=dist.ReduceOp.SUM)
+        grads.append(torch.cat([p.grad.detach().float().flatten() for p in params]) / float(b_small_seqs))
+    g1, g2 = grads
+    dot = float(torch.dot(g1, g2))
+    diff_sq = float(torch.sum((g1 - g2) ** 2))
+    tr_sigma = (b_small_seqs / 2.0) * diff_sq
+    if dot > 0:
+        B_noise_tokens = tr_sigma / dot * seq_len
+    else:
+        B_noise_tokens = float("nan")
+    # Zero ALL model grads, not just Muon-managed `params`. Backward() inside the probe
+    # populates .grad on every trainable param (incl. AdamW-managed embed/proj/scalars);
+    # leaving those stale would contaminate the next training step's gradient on those params.
+    for p in model.parameters():
+        p.grad = None
+    return {"dot": dot, "diff_sq": diff_sq, "tr_sigma": tr_sigma, "B_noise_tokens": B_noise_tokens}
+
+
+########################################
+#               CLI args               #
+########################################
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--config", type=str, default=None, help="JSON file to override CLI args")
+parser.add_argument("--run_id", type=str, default=None)
+parser.add_argument("--batch_size", type=int, default=524288, help="global batch in tokens")
+parser.add_argument("--mu", type=float, default=0.95, help="Muon momentum")
+parser.add_argument("--lr_muon", type=float, default=0.035)
+parser.add_argument("--total_tokens", type=int, default=1_000_000_000)
+parser.add_argument("--seed", type=int, default=0)
+parser.add_argument("--mbs", type=int, default=8, help="per-rank micro-batch size in sequences")
+parser.add_argument("--noise_target_samples", type=int, default=100, help="target number of noise scale probes per run, 0 disables")
+parser.add_argument("--b_small_seqs", type=int, default=128, help="sequences per noise-scale micro-batch")
+args = parser.parse_args()
+if args.config is not None:
+    with open(args.config) as f:
+        cfg = json.load(f)
+    for k, v in cfg.items():
+        assert hasattr(args, k), f"unknown config key: {k}"
+        setattr(args, k, v)
+run_id = args.run_id or f"B{args.batch_size}_mu{args.mu:.2f}_lr{args.lr_muon:.5f}_seed{args.seed}"
+
+# Constants kept in-file (not CLI):
+val_tokens = 20 * 524288
+batch_size = args.batch_size
+mbs = args.mbs
+seq_len = 1024
+
+
+########################################
+#                Setup                 #
+########################################
+
+# torchrun sets these env variables
+device = torch.device("cuda", int(os.environ["LOCAL_RANK"]))
+torch.cuda.set_device(device)
+dist.init_process_group(backend="nccl", device_id=device)
+dist.barrier()
+# this code can be run equivalently with 1, 2, 4, or 8 gpus.
+assert 8 % dist.get_world_size() == 0
+torch.manual_seed(args.seed + dist.get_rank())
+torch.cuda.manual_seed(args.seed + dist.get_rank())
+
+# logging setup
+if dist.get_rank() == 0:
+    os.makedirs("logs", exist_ok=True)
+    os.makedirs("results", exist_ok=True)
+    logfile = f"logs/{run_id}.txt"
+    print(logfile)
+def print0(s, console=False, log=True):
+    if dist.get_rank() == 0:
+        if console:
+            print(s)
+        if log:
+            with open(logfile, "a") as f:
+                print(s, file=f)
+
+# we begin by logging this file itself
+print0(code)
+print0("="*100)
+print0(f"run_id: {run_id}")
+print0(f"args: {json.dumps(vars(args), indent=2)}")
+# print0(f"Running PyTorch {torch.version.__version__} compiled for CUDA {torch.version.cuda}"
+#        + f" on {torch.cuda.get_device_name(device)} with world_size {dist.get_world_size()}")
+print0("="*100)
+
+val_inputs, val_targets = next(distributed_data_generator("data/fineweb10B/fineweb_val_*.bin", val_tokens))
+noise_loader = None
+if args.noise_target_samples > 0:
+    noise_loader = distributed_data_generator("data/fineweb10B/fineweb_val_*.bin", args.b_small_seqs * seq_len)
+
+model = GPT(vocab_size=50304, num_layers=12, model_dim=768).cuda()
+model.compile(dynamic=False)
+
+
+########################################
+#       Init & Optim Hyperparams       #
+########################################
+
+# train for a fixed token budget
+train_steps = max(1, args.total_tokens // batch_size)
+val_step_freq = max(1, 25_000_000 // batch_size)  # ~25M tokens between val passes
+# Noise probes are uniform-in-step-space with `noise_target_samples` per run,
+# so overhead is constant in fraction-of-training compute across B.
+noise_K = max(1, train_steps // args.noise_target_samples) if args.noise_target_samples > 0 else 0
+print0(f"train_steps={train_steps}  val_step_freq={val_step_freq}  noise_K={noise_K}", console=True)
+
+# initialize model parameters
+for name, p in model.named_parameters():
+    w = p.data
+    if name.endswith("weight"):
+        if "proj" in name:
+            w.zero_()
+        elif "embed" in name:
+            w.normal_()  # default torch init
+        else:
+            w.normal_(std=0.33**0.5 / w.size(-1)**0.5)  # default torch init
+    elif name.endswith("bias"):
+        w.zero_()
+    elif name.endswith("gains"):
+        w.normal_(mean=1, std=0)
+    else:
+        raise Exception(f"Uninitialized parameter: {name}")
+
+# create the optimizer(s)
+muon_params = [p for p in model.blocks.parameters() if p.ndim >= 2]
+optimizer1 = AdamW([dict(params=[model.embed.weight], lr=0.3),
+                    dict(params=[model.proj.weight], lr=1/320),
+                    dict(params=[p for p in model.parameters() if p.ndim < 2], lr=0.01)],
+                   betas=(0.8, 0.95), eps=1e-10, weight_decay=0, fused=True)
+optimizer2 = Muon(muon_params, lr=args.lr_muon, weight_decay=0.025, mu=args.mu)
+optimizers = [optimizer1, optimizer2]
+assert set(p for opt in optimizers for group in opt.param_groups
+           for p in group["params"]) == set(model.parameters())
+for opt in optimizers:
+    for group in opt.param_groups:
+        group["initial_lr"] = group["lr"]
+
+# learning rate schedule: stable then decay
+def set_hparams(step, cooldown_frac=0.7):
+    progress = step / train_steps
+    assert 0 <= progress < 1
+    if progress < 1 - cooldown_frac:
+        eta = 1.0
+    else:
+        eta = (1 - progress) / cooldown_frac
+    for opt in optimizers:
+        for group in opt.param_groups:
+            group["lr"] = group["initial_lr"] * eta
+
+
+########################################
+#        Training and Validation       #
+########################################
+
+val_loss_trace = []
+noise_scale_trace = []
+train_step_trace = []  # per-step: train_loss, tokens, examples, lr, time
+train_loader = distributed_data_generator("data/fineweb10B/fineweb_train_*.bin", batch_size)
+for p in model.parameters():
+    dist.broadcast(p.detach(), 0)
+# start the clock
+training_time = 0
+last_val_step = 0
+dist.barrier()
+run_start = time.perf_counter()
+t0 = run_start
+for step in range(train_steps + 1):
+
+    # --------------- VALIDATION SECTION -----------------
+    if step == train_steps or step % val_step_freq == 0:
+        # stop the clock
+        dist.barrier()
+        time_since_last_val = time.perf_counter() - t0
+        step_avg = time_since_last_val / (step - last_val_step) if step > last_val_step else float("nan")
+        last_val_step = step
+        training_time += time_since_last_val
+        val_loss = 0
+        with torch.no_grad():
+            assert len(val_inputs) % mbs == 0
+            for i in range(len(val_inputs) // mbs):
+                val_loss += model(val_inputs[i*mbs:(i+1)*mbs], val_targets[i*mbs:(i+1)*mbs])
+        dist.all_reduce(val_loss, op=dist.ReduceOp.SUM)
+        val_loss = float(val_loss) / val_tokens
+        val_loss_trace.append({"step": step, "tokens": step * batch_size,
+                               "val_loss": val_loss, "training_time_s": training_time})
+        print0(f"step:{step}/{train_steps} val_loss:{val_loss:.5f} train_time:{training_time:.3f}s"
+               + f" step_avg:{1000*step_avg:.2f}ms", console=True)
+        # start the clock again
+        dist.barrier()
+        t0 = time.perf_counter()
+
+    # --------------- NOISE SCALE SECTION -----------------
+    if noise_K > 0 and 0 < step < train_steps and step % noise_K == 0:
+        dist.barrier()
+        ns_t0 = time.perf_counter()
+        ns = measure_noise_scale(model, muon_params, noise_loader,
+                                 args.b_small_seqs, mbs, seq_len)
+        ns.update({"step": step, "tokens": step * batch_size,
+                   "measure_time_s": time.perf_counter() - ns_t0})
+        noise_scale_trace.append(ns)
+        print0(f"step:{step}/{train_steps} B_noise_tokens:{ns['B_noise_tokens']:.1f}"
+               + f" dot:{ns['dot']:.3e} diff_sq:{ns['diff_sq']:.3e}", console=True)
+        dist.barrier()
+        t0 = time.perf_counter()  # don't count noise measurement as training time
+
+    if step == train_steps:
+        break
+
+    # --------------- TRAINING SECTION -----------------
+    inputs, targets = next(train_loader)
+    # accumulate across microbatches in case we are running with fewer than 8 gpus
+    assert len(inputs) % mbs == 0
+    train_loss_sum = torch.zeros((), device="cuda")
+    for i in range(len(inputs) // mbs):
+        loss = model(inputs[i*mbs:(i+1)*mbs], targets[i*mbs:(i+1)*mbs])
+        loss.backward()
+        train_loss_sum = train_loss_sum + loss.detach()
+    for name, p in model.named_parameters():
+        assert p.grad is not None, name
+        dist.all_reduce(p.grad, op=dist.ReduceOp.SUM)
+    dist.all_reduce(train_loss_sum, op=dist.ReduceOp.SUM)
+    train_loss_val = float(train_loss_sum) / batch_size
+    # set optimization hyperparameters and take a step
+    set_hparams(step)
+    lr_muon_now = optimizer2.param_groups[0]["lr"]
+    for opt in optimizers:
+        opt.step()
+    model.zero_grad(set_to_none=True)
+    approx_training_time = training_time + (time.perf_counter() - t0)
+    train_step_trace.append({
+        "step": step + 1,
+        "tokens": (step + 1) * batch_size,
+        "examples": (step + 1) * batch_size // seq_len,
+        "train_loss": train_loss_val,
+        "lr_muon": lr_muon_now,
+        "training_time_s": approx_training_time,
+    })
+    print0(f"step:{step+1}/{train_steps} train_loss:{train_loss_val:.4f}"
+           + f" train_time:{approx_training_time:.3f}s"
+           + f" step_avg:{1000*approx_training_time/(step + 1):.2f}ms",
+           console=True, log=False)
+
+wallclock_seconds = time.perf_counter() - run_start
+
+# dump JSON on rank 0
+if dist.get_rank() == 0:
+    with open(f"results/{run_id}.json", "w") as f:
+        json.dump({
+            "run_id": run_id,
+            "config": vars(args),
+            "world_size": dist.get_world_size(),
+            "train_steps": train_steps,
+            "val_step_freq": val_step_freq,
+            "wallclock_seconds": wallclock_seconds,
+            "final_loss": val_loss_trace[-1]["val_loss"] if val_loss_trace else None,
+            "val_loss_trace": val_loss_trace,
+            "noise_scale_trace": noise_scale_trace,
+            "train_step_trace": train_step_trace,
+        }, f, indent=2)
+    print0(f"wrote results/{run_id}.json", console=True)
+
+dist.destroy_process_group()
+
+====================================================================================================
+run_id: B524288_mu0.85_lr0.02625_seed0
+args: {
+  "config": "configs/sweep/B524288_mu0.85_lr0.02625_seed0.json",
+  "run_id": "B524288_mu0.85_lr0.02625_seed0",
+  "batch_size": 524288,
+  "mu": 0.85,
+  "lr_muon": 0.02625,
+  "total_tokens": 1000000000,
+  "seed": 0,
+  "mbs": 8,
+  "noise_target_samples": 100,
+  "b_small_seqs": 128
+}
+====================================================================================================
+train_steps=1907  val_step_freq=47  noise_K=19
+step:0/1907 val_loss:10.82587 train_time:0.000s step_avg:nanms
+step:19/1907 B_noise_tokens:13486.0 dot:1.704e+05 diff_sq:3.506e+04
+step:38/1907 B_noise_tokens:7472.2 dot:1.764e+05 diff_sq:2.011e+04
+step:47/1907 val_loss:5.49096 train_time:3.999s step_avg:85.08ms
+step:57/1907 B_noise_tokens:10776.0 dot:1.285e+05 diff_sq:2.112e+04
+step:76/1907 B_noise_tokens:12292.8 dot:1.501e+05 diff_sq:2.815e+04
+step:94/1907 val_loss:4.84504 train_time:11.764s step_avg:165.22ms
+step:95/1907 B_noise_tokens:23590.4 dot:9.529e+04 diff_sq:3.430e+04
+step:114/1907 B_noise_tokens:27878.9 dot:9.111e+04 diff_sq:3.876e+04
+step:133/1907 B_noise_tokens:31741.1 dot:8.795e+04 diff_sq:4.260e+04
+step:141/1907 val_loss:4.45190 train_time:15.249s step_avg:74.14ms
+step:152/1907 B_noise_tokens:43169.1 dot:5.609e+04 diff_sq:3.695e+04
+step:171/1907 B_noise_tokens:30216.1 dot:8.003e+04 diff_sq:3.690e+04
+step:188/1907 val_loss:4.25198 train_time:22.788s step_avg:160.42ms
+step:190/1907 B_noise_tokens:24216.6 dot:7.953e+04 diff_sq:2.939e+04
+step:209/1907 B_noise_tokens:26652.3 dot:6.318e+04 diff_sq:2.569e+04
+step:228/1907 B_noise_tokens:33827.2 dot:4.720e+04 diff_sq:2.436e+04
+step:235/1907 val_loss:4.13266 train_time:25.848s step_avg:65.10ms
+step:247/1907 B_noise_tokens:33401.1 dot:4.827e+04 diff_sq:2.460e+04
+step:266/1907 B_noise_tokens:29784.1 dot:5.049e+04 diff_sq:2.295e+04
+step:282/1907 val_loss:4.05074 train_time:32.841s step_avg:148.79ms
+step:285/1907 B_noise_tokens:41438.0 dot:4.334e+04 diff_sq:2.740e+04
+step:304/1907 B_noise_tokens:42001.3 dot:3.649e+04 diff_sq:2.339e+04
+step:323/1907 B_noise_tokens:83307.8 dot:3.141e+04 diff_sq:3.993e+04
+step:329/1907 val_loss:3.98364 train_time:35.484s step_avg:56.23ms
+step:342/1907 B_noise_tokens:48290.4 dot:3.262e+04 diff_sq:2.404e+04
+step:361/1907 B_noise_tokens:32530.3 dot:4.500e+04 diff_sq:2.234e+04
+step:376/1907 val_loss:3.92980 train_time:42.215s step_avg:143.21ms
+step:380/1907 B_noise_tokens:33435.5 dot:4.557e+04 diff_sq:2.325e+04
+step:399/1907 B_noise_tokens:116345.2 dot:3.236e+04 diff_sq:5.744e+04
+step:418/1907 B_noise_tokens:45887.2 dot:3.070e+04 diff_sq:2.150e+04
+step:423/1907 val_loss:3.89451 train_time:44.431s step_avg:47.14ms
+step:437/1907 B_noise_tokens:81351.0 dot:2.107e+04 diff_sq:2.616e+04
+step:456/1907 B_noise_tokens:53815.2 dot:2.876e+04 diff_sq:2.361e+04
+step:470/1907 val_loss:3.85304 train_time:50.378s step_avg:126.55ms
+step:475/1907 B_noise_tokens:54671.5 dot:2.911e+04 diff_sq:2.428e+04
+step:494/1907 B_noise_tokens:90337.8 dot:2.881e+04 diff_sq:3.971e+04
+step:513/1907 B_noise_tokens:66942.7 dot:2.265e+04 diff_sq:2.313e+04
+step:517/1907 val_loss:3.82529 train_time:52.116s step_avg:36.97ms
+step:532/1907 B_noise_tokens:51926.9 dot:2.844e+04 diff_sq:2.253e+04
+step:551/1907 B_noise_tokens:54457.0 dot:4.006e+04 diff_sq:3.329e+04
+step:564/1907 val_loss:3.79706 train_time:58.150s step_avg:128.39ms
+step:570/1907 B_noise_tokens:75621.3 dot:2.196e+04 diff_sq:2.534e+04
+step:589/1907 B_noise_tokens:59254.3 dot:2.613e+04 diff_sq:2.363e+04
+step:608/1907 B_noise_tokens:47303.5 dot:2.554e+04 diff_sq:1.843e+04
+step:611/1907 val_loss:3.76945 train_time:59.526s step_avg:29.28ms
+step:627/1907 B_noise_tokens:49323.9 dot:3.142e+04 diff_sq:2.365e+04
+step:646/1907 B_noise_tokens:66218.9 dot:2.318e+04 diff_sq:2.342e+04
+step:658/1907 val_loss:3.74535 train_time:64.852s step_avg:113.32ms
+step:665/1907 B_noise_tokens:91784.0 dot:1.738e+04 diff_sq:2.434e+04
+step:684/1907 B_noise_tokens:70039.5 dot:2.179e+04 diff_sq:2.329e+04
+step:703/1907 B_noise_tokens:82743.7 dot:1.810e+04 diff_sq:2.285e+04
+step:705/1907 val_loss:3.71760 train_time:65.782s step_avg:19.77ms
+step:722/1907 B_noise_tokens:74683.6 dot:1.912e+04 diff_sq:2.179e+04
+step:741/1907 B_noise_tokens:78655.0 dot:1.866e+04 diff_sq:2.239e+04
+step:752/1907 val_loss:3.69493 train_time:70.742s step_avg:105.54ms
+step:760/1907 B_noise_tokens:77545.9 dot:1.668e+04 diff_sq:1.974e+04
+step:779/1907 B_noise_tokens:113686.0 dot:1.254e+04 diff_sq:2.175e+04
+step:798/1907 B_noise_tokens:55396.1 dot:2.111e+04 diff_sq:1.784e+04
+step:799/1907 val_loss:3.67879 train_time:71.202s step_avg:9.79ms
+step:817/1907 B_noise_tokens:94104.0 dot:1.799e+04 diff_sq:2.583e+04
+step:836/1907 B_noise_tokens:99087.5 dot:1.986e+04 diff_sq:3.003e+04
+step:846/1907 val_loss:3.65523 train_time:75.567s step_avg:92.87ms
+step:855/1907 B_noise_tokens:60149.7 dot:2.575e+04 diff_sq:2.363e+04
+step:874/1907 B_noise_tokens:85663.4 dot:1.639e+04 diff_sq:2.143e+04
+step:893/1907 val_loss:3.63423 train_time:84.022s step_avg:179.89ms
+step:893/1907 B_noise_tokens:96022.1 dot:1.629e+04 diff_sq:2.387e+04
+step:912/1907 B_noise_tokens:137678.7 dot:9.910e+03 diff_sq:2.082e+04
+step:931/1907 B_noise_tokens:96224.5 dot:1.623e+04 diff_sq:2.383e+04
+step:940/1907 val_loss:3.61873 train_time:88.050s step_avg:85.70ms
+step:950/1907 B_noise_tokens:111093.9 dot:1.279e+04 diff_sq:2.168e+04
+step:969/1907 B_noise_tokens:101799.7 dot:1.597e+04 diff_sq:2.480e+04
+step:987/1907 val_loss:3.60351 train_time:96.052s step_avg:170.26ms
+step:988/1907 B_noise_tokens:87916.9 dot:1.745e+04 diff_sq:2.340e+04
+step:1007/1907 B_noise_tokens:168668.3 dot:1.010e+04 diff_sq:2.599e+04
+step:1026/1907 B_noise_tokens:148755.7 dot:1.082e+04 diff_sq:2.456e+04
+step:1034/1907 val_loss:3.58419 train_time:99.635s step_avg:76.23ms
+step:1045/1907 B_noise_tokens:104769.0 dot:1.562e+04 diff_sq:2.497e+04
+step:1064/1907 B_noise_tokens:143160.5 dot:1.209e+04 diff_sq:2.640e+04
+step:1081/1907 val_loss:3.57135 train_time:107.133s step_avg:159.53ms
+step:1083/1907 B_noise_tokens:136394.2 dot:1.189e+04 diff_sq:2.475e+04
+step:1102/1907 B_noise_tokens:105789.0 dot:1.563e+04 diff_sq:2.523e+04
+step:1121/1907 B_noise_tokens:138771.7 dot:1.237e+04 diff_sq:2.619e+04
+step:1128/1907 val_loss:3.55850 train_time:110.183s step_avg:64.91ms
+step:1140/1907 B_noise_tokens:179144.3 dot:9.745e+03 diff_sq:2.664e+04
+step:1159/1907 B_noise_tokens:156873.4 dot:1.244e+04 diff_sq:2.979e+04
+step:1175/1907 val_loss:3.54419 train_time:117.404s step_avg:153.64ms
+step:1178/1907 B_noise_tokens:202739.8 dot:9.920e+03 diff_sq:3.069e+04
+step:1197/1907 B_noise_tokens:194416.2 dot:1.127e+04 diff_sq:3.343e+04
+step:1216/1907 B_noise_tokens:144456.8 dot:1.200e+04 diff_sq:2.645e+04
+step:1222/1907 val_loss:3.52899 train_time:120.192s step_avg:59.31ms
+step:1235/1907 B_noise_tokens:325359.6 dot:1.250e+04 diff_sq:6.206e+04
+step:1254/1907 B_noise_tokens:147878.1 dot:1.367e+04 diff_sq:3.085e+04
+step:1269/1907 val_loss:3.51815 train_time:126.772s step_avg:140.00ms
+step:1273/1907 B_noise_tokens:155544.2 dot:1.258e+04 diff_sq:2.987e+04
+step:1292/1907 B_noise_tokens:181302.2 dot:1.034e+04 diff_sq:2.860e+04
+step:1311/1907 B_noise_tokens:1032002.8 dot:7.095e+03 diff_sq:1.117e+05
+step:1316/1907 val_loss:3.50425 train_time:129.001s step_avg:47.41ms
+step:1330/1907 B_noise_tokens:226031.3 dot:8.590e+03 diff_sq:2.963e+04
+step:1349/1907 B_noise_tokens:276796.5 dot:7.509e+03 diff_sq:3.172e+04
+step:1363/1907 val_loss:3.49404 train_time:135.211s step_avg:132.13ms
+step:1368/1907 B_noise_tokens:252313.0 dot:8.400e+03 diff_sq:3.234e+04
+step:1387/1907 B_noise_tokens:577051.6 dot:5.458e+03 diff_sq:4.805e+04
+step:1406/1907 B_noise_tokens:499997.7 dot:5.202e+03 diff_sq:3.969e+04
+step:1410/1907 val_loss:3.48153 train_time:136.986s step_avg:37.76ms
+step:1425/1907 B_noise_tokens:456188.6 dot:4.900e+03 diff_sq:3.411e+04
+step:1444/1907 B_noise_tokens:489838.1 dot:4.445e+03 diff_sq:3.323e+04
+step:1457/1907 val_loss:3.46879 train_time:142.734s step_avg:122.32ms
+step:1463/1907 B_noise_tokens:399089.0 dot:5.454e+03 diff_sq:3.321e+04
+step:1482/1907 B_noise_tokens:472083.4 dot:5.189e+03 diff_sq:3.738e+04
+step:1501/1907 B_noise_tokens:282149.8 dot:8.216e+03 diff_sq:3.537e+04
+step:1504/1907 val_loss:3.45740 train_time:144.042s step_avg:27.81ms
+step:1520/1907 B_noise_tokens:513524.4 dot:4.353e+03 diff_sq:3.411e+04
+step:1539/1907 B_noise_tokens:729865.9 dot:3.724e+03 diff_sq:4.147e+04
+step:1551/1907 val_loss:3.44676 train_time:149.345s step_avg:112.84ms
+step:1558/1907 B_noise_tokens:692843.6 dot:3.681e+03 diff_sq:3.892e+04
+step:1577/1907 B_noise_tokens:609355.7 dot:3.735e+03 diff_sq:3.473e+04
+step:1596/1907 B_noise_tokens:581506.2 dot:4.083e+03 diff_sq:3.623e+04
+step:1598/1907 val_loss:3.43620 train_time:150.216s step_avg:18.54ms
+step:1615/1907 B_noise_tokens:1166894.8 dot:2.772e+03 diff_sq:4.936e+04
+step:1634/1907 B_noise_tokens:1010725.1 dot:2.643e+03 diff_sq:4.075e+04
+step:1645/1907 val_loss:3.42660 train_time:154.976s step_avg:101.26ms
+step:1653/1907 B_noise_tokens:1773543.3 dot:1.354e+03 diff_sq:3.665e+04
+step:1672/1907 B_noise_tokens:2750050.4 dot:2.546e+03 diff_sq:1.068e+05
+step:1691/1907 B_noise_tokens:2144952.5 dot:1.315e+03 diff_sq:4.305e+04
+step:1692/1907 val_loss:3.41753 train_time:155.418s step_avg:9.41ms
+step:1710/1907 B_noise_tokens:1275297.0 dot:2.139e+03 diff_sq:4.163e+04
+step:1729/1907 B_noise_tokens:1042155.9 dot:2.815e+03 diff_sq:4.476e+04
+step:1739/1907 val_loss:3.40885 train_time:159.862s step_avg:94.55ms
+step:1748/1907 B_noise_tokens:1914680.7 dot:1.305e+03 diff_sq:3.813e+04
+step:1767/1907 B_noise_tokens:1253293.6 dot:2.017e+03 diff_sq:3.856e+04
+step:1786/1907 val_loss:3.40162 train_time:168.066s step_avg:174.56ms
+step:1786/1907 B_noise_tokens:10554848.2 dot:2.540e+02 diff_sq:4.090e+04
+step:1805/1907 B_noise_tokens:1288672.1 dot:1.985e+03 diff_sq:3.903e+04
+step:1824/1907 B_noise_tokens:3130374.9 dot:8.532e+02 diff_sq:4.076e+04
+step:1833/1907 val_loss:3.39541 train_time:172.084s step_avg:85.49ms
+step:1843/1907 B_noise_tokens:2542289.5 dot:1.028e+03 diff_sq:3.988e+04
+step:1862/1907 B_noise_tokens:8025734.1 dot:3.416e+02 diff_sq:4.183e+04
+step:1880/1907 val_loss:3.39095 train_time:180.058s step_avg:169.67ms
+step:1881/1907 B_noise_tokens:3877501.3 dot:6.915e+02 diff_sq:4.092e+04
+step:1900/1907 B_noise_tokens:110163293.1 dot:2.452e+01 diff_sq:4.122e+04
+step:1907/1907 val_loss:3.38986 train_time:183.222s step_avg:117.16ms
+wrote results/B524288_mu0.85_lr0.02625_seed0.json
